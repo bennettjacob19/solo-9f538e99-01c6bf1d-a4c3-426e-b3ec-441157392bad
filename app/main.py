@@ -13,7 +13,6 @@ from .decisions import DEFAULT_TARGET, Decision, decide
 from .histogram import combine_instances
 from .scraper import ScrapeStore, store_lifespan
 
-
 def _instance_urls() -> dict[str, str]:
     raw = os.environ.get(
         "SCRAPE_TARGETS",
@@ -102,12 +101,15 @@ def create_app() -> FastAPI:
         deadline = started + max_wait_seconds
         # Each request owns its deadline; cancellation of another request
         # never reaches the shared store.
-        ready, missing = await store.wait_for_samples(deadline)
+        ready, missing, outcomes = await store.wait_for_samples(deadline)
         waited = time.monotonic() - started
         timed_out = bool(missing)
 
         if missing:
-            reasons = {name: _missing_reason(store, name) for name in missing}
+            reasons = {
+                name: store.missing_reason(name, outcomes.get(name))
+                for name in missing
+            }
             return CheckResponse(
                 decision=Decision.INCONCLUSIVE,
                 reason=(
@@ -160,9 +162,15 @@ def create_app() -> FastAPI:
 
     @app.get("/stats", tags=["核查"])
     async def stats() -> dict:
-        """Actual scrape counts and the timestamps of samples in use."""
-        data = store.stats()
+        """Actual scrape counts, integrity issues and the samples in use."""
         now = time.time()
+        # Evaluate readiness first: validation may discover a contradictory
+        # increment and raise the quarantine barrier, and the counters below
+        # must reflect that post-validation state.
+        outcomes = {
+            name: store.sample_status(name, now) for name in store.instances
+        }
+        data = store.stats()
         data["checked_at"] = now
         data["config"] = {
             "min_sample_gap_seconds": store.min_gap,
@@ -170,8 +178,9 @@ def create_app() -> FastAPI:
             "scrape_interval_seconds": store.scrape_interval,
         }
         data["current_ready_samples"] = {}
-        for name in store.instances:
-            outcome = store.sample_status(name, now)
+        data["instance_issues"] = {}
+        has_issues = False
+        for name, outcome in outcomes.items():
             if hasattr(outcome, "earlier"):
                 data["current_ready_samples"][name] = {
                     "earlier_scrape_at": outcome.earlier.at,
@@ -181,7 +190,20 @@ def create_app() -> FastAPI:
                     "requests_in_window": outcome.delta.total_requests,
                 }
             else:
-                data["current_ready_samples"][name] = {"not_ready_reason": outcome}
+                data["current_ready_samples"][name] = {
+                    "not_ready_reason": outcome,
+                    "reason_text": store.missing_reason(name, outcome),
+                }
+            # Surface the latest integrity problem per instance, flagging
+            # whether the evidence barrier it raised is still in force.
+            issue = store.instances[name].last_issue
+            if issue is not None:
+                data["instance_issues"][name] = {
+                    **issue.as_dict(),
+                    "active": store.issue_is_active(name),
+                }
+                has_issues = True
+        data["has_issues"] = has_issues
         return data
 
     @app.get("/health", tags=["运维"])
@@ -189,21 +211,6 @@ def create_app() -> FastAPI:
         return {"ok": True}
 
     return app
-
-
-def _missing_reason(store: ScrapeStore, name: str) -> str:
-    outcome = store.sample_status(name)
-    if isinstance(outcome, str):
-        return _REASON_TEXT.get(outcome, outcome)
-    return "ready"
-
-
-_REASON_TEXT = {
-    "insufficient_scrapes": "成功抓取不足两次",
-    "stale_scrape": "最近抓取超出近 3 秒新鲜窗口",
-    "samples_too_close": "两次抓取间隔不足 1 秒",
-    "process_restarted": "两次抓取来自不同进程（疑似重启）",
-}
 
 
 app = create_app()

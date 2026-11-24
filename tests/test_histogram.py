@@ -6,12 +6,15 @@ import pytest
 
 from app.histogram import (
     INF,
+    DeltaIntegrityError,
     HistogramSnapshot,
     MetricsParseError,
+    SnapshotIntegrityError,
     combine_instances,
     compliant_count_bounds,
     compute_delta,
     parse_metrics_text,
+    validate_snapshot,
 )
 
 SAMPLE_A = """# HELP http_request_duration_seconds request latency
@@ -180,3 +183,157 @@ def test_combine_zero_traffic():
     combined = combine_instances({"a": delta, "b": delta}, threshold_s=0.3)
     assert combined.is_zero_traffic
     assert combined.lower_ratio == combined.upper_ratio == 0.0
+
+
+# --------------------------------------------------------------------------- #
+# Snapshot integrity
+# --------------------------------------------------------------------------- #
+
+def _text(bucket_lines, count_line, sum_line, run_id="r1"):
+    lines = ["# TYPE http_request_duration_seconds histogram"]
+    lines.extend(bucket_lines)
+    lines.append(count_line)
+    lines.append(sum_line)
+    lines.append("process_start_time_seconds 1.7e9")
+    return "\n".join(lines) + "\n"
+
+
+def test_parse_rejects_mixed_process_identity():
+    text = _text(
+        [
+            'http_request_duration_seconds_bucket{le="0.1",run_id="r1"} 5',
+            'http_request_duration_seconds_bucket{le="+Inf",run_id="r2"} 5',
+        ],
+        'http_request_duration_seconds_count{run_id="r1"} 5',
+        'http_request_duration_seconds_sum{run_id="r1"} 1.0',
+    )
+    with pytest.raises(SnapshotIntegrityError) as excinfo:
+        parse_metrics_text(text, "http_request_duration_seconds", 0.0)
+    assert excinfo.value.code == "mixed_process_identity"
+
+
+def test_parse_rejects_non_monotonic_buckets():
+    text = _text(
+        [
+            'http_request_duration_seconds_bucket{le="0.1",run_id="r1"} 50',
+            'http_request_duration_seconds_bucket{le="0.5",run_id="r1"} 40',
+            'http_request_duration_seconds_bucket{le="+Inf",run_id="r1"} 50',
+        ],
+        'http_request_duration_seconds_count{run_id="r1"} 50',
+        'http_request_duration_seconds_sum{run_id="r1"} 1.0',
+    )
+    with pytest.raises(SnapshotIntegrityError) as excinfo:
+        parse_metrics_text(text, "http_request_duration_seconds", 0.0)
+    assert excinfo.value.code == "non_monotonic_buckets"
+
+
+def test_parse_rejects_inf_count_mismatch():
+    text = _text(
+        [
+            'http_request_duration_seconds_bucket{le="0.1",run_id="r1"} 5',
+            'http_request_duration_seconds_bucket{le="+Inf",run_id="r1"} 9',
+        ],
+        'http_request_duration_seconds_count{run_id="r1"} 5',
+        'http_request_duration_seconds_sum{run_id="r1"} 1.0',
+    )
+    with pytest.raises(SnapshotIntegrityError) as excinfo:
+        parse_metrics_text(text, "http_request_duration_seconds", 0.0)
+    assert excinfo.value.code == "inf_mismatch"
+
+
+def test_parse_rejects_bucket_above_total():
+    text = _text(
+        [
+            'http_request_duration_seconds_bucket{le="0.1",run_id="r1"} 7',
+            'http_request_duration_seconds_bucket{le="+Inf",run_id="r1"} 5',
+        ],
+        'http_request_duration_seconds_count{run_id="r1"} 5',
+        'http_request_duration_seconds_sum{run_id="r1"} 1.0',
+    )
+    with pytest.raises(SnapshotIntegrityError) as excinfo:
+        parse_metrics_text(text, "http_request_duration_seconds", 0.0)
+    assert excinfo.value.code == "bucket_exceeds_total"
+
+
+def test_parse_rejects_missing_process_identity():
+    text = (
+        "# TYPE http_request_duration_seconds histogram\n"
+        'http_request_duration_seconds_bucket{le="0.1"} 5\n'
+        'http_request_duration_seconds_bucket{le="+Inf"} 5\n'
+        "http_request_duration_seconds_count 5\n"
+        "http_request_duration_seconds_sum 1.0\n"
+    )
+    with pytest.raises(SnapshotIntegrityError) as excinfo:
+        parse_metrics_text(text, "http_request_duration_seconds", 0.0)
+    assert excinfo.value.code == "missing_process_identity"
+
+
+def test_parse_rejects_duplicate_boundary():
+    text = _text(
+        [
+            'http_request_duration_seconds_bucket{le="0.1",run_id="r1"} 5',
+            'http_request_duration_seconds_bucket{le="0.1",run_id="r1"} 6',
+            'http_request_duration_seconds_bucket{le="+Inf",run_id="r1"} 6',
+        ],
+        'http_request_duration_seconds_count{run_id="r1"} 6',
+        'http_request_duration_seconds_sum{run_id="r1"} 1.0',
+    )
+    with pytest.raises(SnapshotIntegrityError) as excinfo:
+        parse_metrics_text(text, "http_request_duration_seconds", 0.0)
+    assert excinfo.value.code == "duplicate_bucket"
+
+
+def test_parse_accepts_consistent_snapshot():
+    text = _text(
+        [
+            'http_request_duration_seconds_bucket{le="0.1",run_id="r1"} 5',
+            'http_request_duration_seconds_bucket{le="+Inf",run_id="r1"} 7',
+        ],
+        'http_request_duration_seconds_count{run_id="r1"} 7',
+        'http_request_duration_seconds_sum{run_id="r1"} 1.0',
+    )
+    snap = parse_metrics_text(text, "http_request_duration_seconds", 0.0)
+    assert snap.process_id == "r1"
+    assert snap.buckets[INF] == 7
+    validate_snapshot(snap)
+
+
+# --------------------------------------------------------------------------- #
+# Delta integrity
+# --------------------------------------------------------------------------- #
+
+def test_delta_rejects_decreasing_cumulative_increment():
+    # Each snapshot is individually valid, but the cumulative increment
+    # decreases with the boundary: impossible for one process lifetime.
+    old = _snap([0.1, 0.5, 1.0], [10, 30, 40], 40, 5.0)
+    new = _snap([0.1, 0.5, 1.0], [20, 35, 60], 60, 9.0, at=1.1)
+    with pytest.raises(DeltaIntegrityError) as excinfo:
+        compute_delta(old, new)
+    assert excinfo.value.code == "cumulative_delta_decreases"
+
+
+def test_delta_rejects_increment_above_total_increment():
+    # Both snapshots are individually valid (in-flight observations keep
+    # buckets <= _count), but the cumulative increment at the largest finite
+    # boundary exceeds the increment of _count.
+    old = _snap([0.1, 0.5], [0, 5], 10, 1.0)
+    new = _snap([0.1, 0.5], [5, 20], 20, 3.0, at=1.1)
+    with pytest.raises(DeltaIntegrityError) as excinfo:
+        compute_delta(old, new)
+    assert excinfo.value.code == "delta_exceeds_total"
+
+
+def test_delta_rejects_sum_decrease():
+    old = _snap([0.1, 0.5], [1, 2], 3, 5.0)
+    new = _snap([0.1, 0.5], [2, 3], 4, 4.0, at=1.1)
+    with pytest.raises(DeltaIntegrityError) as excinfo:
+        compute_delta(old, new)
+    assert excinfo.value.code == "counter_reset"
+
+
+def test_delta_rejects_mixed_process_ids():
+    old = _snap([0.1, 0.5], [1, 2], 3, 5.0, pid="p1")
+    new = _snap([0.1, 0.5], [2, 3], 4, 6.0, pid="p2", at=1.1)
+    with pytest.raises(DeltaIntegrityError) as excinfo:
+        compute_delta(old, new)
+    assert excinfo.value.code == "process_restarted"

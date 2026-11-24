@@ -10,13 +10,31 @@ Runtime controls (used by tests and demos):
 * ``POST /restart`` -- simulate a process restart: new run id, new process
                        start time, all counters reset to zero
 * ``GET  /state``   -- inspect the in-memory counters
+
+Consistency model
+-----------------
+Writes (inject / restart) mutate the live counters in place under a lock.
+``GET /metrics`` takes **one** immutable snapshot of the whole histogram
+(run id, process start, every bucket, ``_count``, ``_sum`` and the scrape
+sequence) while holding that lock for a few microseconds, then releases it
+*before* the body is encoded.  Consequently:
+
+* every response describes exactly one process at exactly one instant -- a
+  restart or an injection can never tear the exposition in half;
+* a slow / stuck client only retains the one snapshot copy it is being
+  served, so the number of retained old bucket copies is bounded by the
+  number of in-flight scrapes, no matter how many writes arrive;
+* writers never wait for response encoding, so inject / restart complete
+  even while scrapes are blocked on their bodies.
 """
 
 from __future__ import annotations
 
 import os
+import threading
 import time
 import uuid
+from dataclasses import dataclass
 
 from fastapi import FastAPI
 from fastapi.responses import PlainTextResponse
@@ -32,29 +50,127 @@ class InjectBody(BaseModel):
     count: int = Field(1, ge=1, le=100_000)
 
 
+@dataclass(frozen=True)
+class HistogramView:
+    """One immutable, internally consistent view of the target process."""
+
+    run_id: str
+    process_start: float
+    boundaries: tuple[float, ...]
+    bucket_counts: dict[float, int]
+    total_count: int
+    total_sum: float
+    scrape_seq: int
+    restart_count: int
+
+
 class TargetState:
     def __init__(self, instance_id: str, boundaries: list[float]) -> None:
         self.instance_id = instance_id
         self.boundaries = boundaries
+        self._lock = threading.Lock()
+        # Number of snapshot copies currently held by in-flight scrapes.
+        self._outstanding_snapshots = 0
         self.reset()
 
     def reset(self) -> None:
-        """Restart the (simulated) process."""
-        self.run_id = uuid.uuid4().hex[:12]
-        self.process_start = time.time()
-        # cumulative counts per finite boundary + +Inf
-        self.bucket_counts: dict[float, int] = {b: 0 for b in self.boundaries}
-        self.total_count = 0
-        self.total_sum = 0.0
-        self.scrape_seq = 0
-        self.restart_count = getattr(self, "restart_count", 0) + 1
+        """Restart the (simulated) process atomically."""
+        with self._lock:
+            self.run_id = uuid.uuid4().hex[:12]
+            self.process_start = time.time()
+            # cumulative counts per finite boundary + +Inf
+            self.bucket_counts: dict[float, int] = {b: 0 for b in self.boundaries}
+            self.total_count = 0
+            self.total_sum = 0.0
+            self.scrape_seq = 0
+            self.restart_count = getattr(self, "restart_count", 0) + 1
 
-    def inject(self, duration: float, count: int) -> None:
-        for boundary in self.boundaries:
-            if duration <= boundary:
-                self.bucket_counts[boundary] += count
-        self.total_count += count
-        self.total_sum += duration * count
+    def inject(self, duration: float, count: int) -> int:
+        with self._lock:
+            for boundary in self.boundaries:
+                if duration <= boundary:
+                    self.bucket_counts[boundary] += count
+            self.total_count += count
+            self.total_sum += duration * count
+            return self.total_count
+
+    # -- read side ----------------------------------------------------- #
+
+    def take_snapshot(self) -> HistogramView:
+        """Atomically copy the whole histogram; also count it as in flight.
+
+        The caller must call :meth:`release_snapshot` exactly once when it is
+        done with the view.  Only this copy (not every write) is retained, so
+        old bucket copies never outnumber in-flight scrapes.
+        """
+        with self._lock:
+            self.scrape_seq += 1
+            self._outstanding_snapshots += 1
+            return HistogramView(
+                run_id=self.run_id,
+                process_start=self.process_start,
+                boundaries=tuple(self.boundaries),
+                bucket_counts=dict(self.bucket_counts),
+                total_count=self.total_count,
+                total_sum=self.total_sum,
+                scrape_seq=self.scrape_seq,
+                restart_count=self.restart_count,
+            )
+
+    def release_snapshot(self) -> None:
+        with self._lock:
+            if self._outstanding_snapshots > 0:
+                self._outstanding_snapshots -= 1
+
+    def state_payload(self) -> dict:
+        with self._lock:
+            return {
+                "instance_id": self.instance_id,
+                "run_id": self.run_id,
+                "process_start_time_seconds": self.process_start,
+                "boundaries": list(self.boundaries),
+                "bucket_counts": dict(self.bucket_counts),
+                "count": self.total_count,
+                "sum": self.total_sum,
+                "restart_count": self.restart_count,
+                "scrape_seq": self.scrape_seq,
+                "outstanding_snapshot_copies": self._outstanding_snapshots,
+            }
+
+
+def render_metrics(view: HistogramView) -> str:
+    """Render one exposition body from a single immutable view."""
+
+    lines = [
+        f"# HELP {METRIC_NAME} request latency in seconds",
+        f"# TYPE {METRIC_NAME} histogram",
+    ]
+    for boundary in view.boundaries:
+        lines.append(
+            f'{METRIC_NAME}_bucket{{le="{boundary:g}",run_id="{view.run_id}"}} '
+            f"{view.bucket_counts[boundary]}"
+        )
+    lines.append(
+        f'{METRIC_NAME}_bucket{{le="+Inf",run_id="{view.run_id}"}} '
+        f"{view.total_count}"
+    )
+    lines.append(
+        f'{METRIC_NAME}_count{{run_id="{view.run_id}"}} {view.total_count}'
+    )
+    lines.append(
+        f'{METRIC_NAME}_sum{{run_id="{view.run_id}"}} {view.total_sum}'
+    )
+    lines.extend(
+        [
+            "# HELP process_start_time_seconds start time of the process since unix epoch",
+            "# TYPE process_start_time_seconds gauge",
+            f"process_start_time_seconds {view.process_start:.6f}",
+            "# HELP sample_scrape_seq number of scrapes served since process start",
+            "# TYPE sample_scrape_seq gauge",
+            f"sample_scrape_seq {view.scrape_seq}",
+        ]
+    )
+    return "\n".join(lines) + "\n"
 
 
 def _read_buckets(instance_id: str) -> list[float]:
@@ -75,8 +191,8 @@ def create_app() -> FastAPI:
 
     @app.post("/inject")
     def inject(body: InjectBody) -> dict:
-        state.inject(body.duration_seconds, body.count)
-        return {"ok": True, "total_count": state.total_count}
+        total = state.inject(body.duration_seconds, body.count)
+        return {"ok": True, "total_count": total}
 
     @app.post("/restart")
     def restart() -> dict:
@@ -85,45 +201,20 @@ def create_app() -> FastAPI:
 
     @app.get("/state")
     def get_state() -> dict:
-        return {
-            "instance_id": state.instance_id,
-            "run_id": state.run_id,
-            "process_start_time_seconds": state.process_start,
-            "boundaries": state.boundaries,
-            "bucket_counts": state.bucket_counts,
-            "count": state.total_count,
-            "sum": state.total_sum,
-            "restart_count": state.restart_count,
-        }
+        return state.state_payload()
 
     # Plain-text exposition, returned with the Prometheus content type.
     @app.get("/metrics", response_class=PlainTextResponse)
-    def render_metrics() -> PlainTextResponse:
-        lines = [
-            f"# HELP {METRIC_NAME} request latency in seconds",
-            f"# TYPE {METRIC_NAME} histogram",
-        ]
-        for boundary, value in state.bucket_counts.items():
-            lines.append(
-                f'{METRIC_NAME}_bucket{{le="{boundary:g}",run_id="{state.run_id}"}} {value}'
-            )
-        lines.append(
-            f'{METRIC_NAME}_bucket{{le="+Inf",run_id="{state.run_id}"}} {state.total_count}'
-        )
-        lines.append(f'{METRIC_NAME}_count{{run_id="{state.run_id}"}} {state.total_count}')
-        lines.append(f'{METRIC_NAME}_sum{{run_id="{state.run_id}"}} {state.total_sum}')
-        lines.extend(
-            [
-                "# HELP process_start_time_seconds start time of the process since unix epoch",
-                "# TYPE process_start_time_seconds gauge",
-                f"process_start_time_seconds {state.process_start:.6f}",
-                "# HELP sample_scrape_seq number of scrapes served since process start",
-                "# TYPE sample_scrape_seq gauge",
-                f"sample_scrape_seq {state.scrape_seq}",
-            ]
-        )
-        state.scrape_seq += 1
-        return PlainTextResponse("\n".join(lines) + "\n", media_type="text/plain; version=0.0.4")
+    def render_metrics_endpoint() -> PlainTextResponse:
+        # The view is an immutable deep copy of the whole histogram; the
+        # lock is released before the body is rendered/encoded, so a writer
+        # (inject / restart) never waits for a slow scrape response.
+        view = state.take_snapshot()
+        try:
+            body = render_metrics(view)
+        finally:
+            state.release_snapshot()
+        return PlainTextResponse(body, media_type="text/plain; version=0.0.4")
 
     return app
 

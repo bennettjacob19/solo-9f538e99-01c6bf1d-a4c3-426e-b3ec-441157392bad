@@ -96,3 +96,95 @@ def test_select_counter_reset_treated_as_restart():
 def test_gap_constant_matches_requirement():
     assert MIN_SAMPLE_GAP >= 1.0
     assert FRESHNESS_WINDOW <= 3.0
+
+
+# --------------------------------------------------------------------------- #
+# Integrity quarantine
+# --------------------------------------------------------------------------- #
+
+def _seq_records(records):
+    """Assign monotonically increasing scrape sequence numbers."""
+    for index, record in enumerate(records):
+        record.seq = index
+    return records
+
+
+def test_inconsistent_increment_quarantines_until_two_new_scrapes():
+    now = time.time()
+    # Same process id and valid per-snapshot buckets, but the cumulative
+    # increment falls as the boundary rises -> contradiction.
+    bad_earlier = _record(now - 1.6, "p1", counts=(10, 30, 40), total=40)
+    bad_later = _record(now - 0.6, "p1", counts=(20, 35, 60), total=60)
+    store = _store(_seq_records([bad_earlier, bad_later]))
+
+    outcome = store._select_sample(store.instances["i1"], now)
+    assert outcome == "inconsistent_increment"
+    state = store.instances["i1"]
+    assert state.last_issue is not None
+    assert state.last_issue.code == "cumulative_delta_decreases"
+    assert state.valid_from_seq == 1
+    # The offending snapshots are discarded: not even one usable scrape.
+    assert store._select_sample(state, now) == "insufficient_scrapes"
+    assert "累计增量随边界下降" in store.missing_reason("i1")
+
+    # One new scrape is not enough to clear the barrier.
+    state.history.append(
+        _record(now + 0.5, "p1", counts=(30, 45, 70), total=70)
+    )
+    state.history[-1].seq = 2
+    assert store._select_sample(state, now + 1.0) == "insufficient_scrapes"
+    assert "需等待两次新的合格同进程抓取" in store.missing_reason("i1")
+
+    # Two new same-process scrapes form a fresh, consistent sample.
+    state.history.append(
+        _record(now + 1.6, "p1", counts=(40, 55, 80), total=80)
+    )
+    state.history[-1].seq = 3
+    fresh = store._select_sample(state, now + 2.0)
+    assert not isinstance(fresh, str)
+    assert fresh.delta.total_requests == 10
+
+
+def test_stats_reports_instance_and_reason():
+    now = time.time()
+    store = _store(_seq_records([
+        _record(now - 1.6, "p1", counts=(10, 30, 40), total=40),
+        _record(now - 0.6, "p1", counts=(20, 35, 60), total=60),
+    ]))
+    assert store._select_sample(store.instances["i1"], now) == "inconsistent_increment"
+    stats = store.stats()
+    info = stats["instances"]["i1"]
+    assert info["last_issue"]["code"] == "cumulative_delta_decreases"
+    assert "累计增量随边界下降" in info["last_issue"]["reason"]
+    assert info["issues"]
+    assert info["usable_scrapes"] == 0
+
+
+def test_mixed_snapshot_is_not_recorded_as_success(monkeypatch):
+    # A scrape rejected by the parser must not enter the sample selection.
+    from app.histogram import MetricsParseError
+    import app.scraper as scraper_module
+
+    class FakeResponse:
+        text = "broken"
+
+        def raise_for_status(self):
+            return None
+
+    class FakeClient:
+        async def get(self, url):
+            return FakeResponse()
+
+    def boom(text, metric, at):
+        raise MetricsParseError("no buckets")
+
+    monkeypatch.setattr(scraper_module, "parse_metrics_text", boom)
+    store = ScrapeStore({"i1": "http://x/metrics"})
+    store._client = FakeClient()
+    import asyncio
+
+    asyncio.run(store._scrape_once(store.instances["i1"]))
+    state = store.instances["i1"]
+    assert state.total_attempts == 1
+    assert state.total_failures == 1
+    assert state.usable_successes() == []
